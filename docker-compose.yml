@@ -16,6 +16,7 @@ services:
       MODEL_STORAGE: /models
       MODEL_STORAGE_BACKEND: "${MODEL_STORAGE_BACKEND:-filesystem}"
       DATA_DIR: /data
+      DATABASE_URL: "${DATABASE_URL:-}"
       HF_ENDPOINT: "${HF_ENDPOINT:-https://huggingface.co}"
       HF_TOKEN: "${HF_TOKEN:-}"
       MAX_CONCURRENT_DOWNLOADS: "${MAX_CONCURRENT_DOWNLOADS:-2}"

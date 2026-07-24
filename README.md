@@ -45,6 +45,7 @@
 
 - Familiar Hub-style model catalog with visual, metadata-driven model cards plus task, format, local-app, parameter, and sort filters
 - Live Hugging Face metadata, repository file lists, richly rendered model cards, gated status, likes, and download counts
+- On-demand GGUF metadata and tensor inspection with shard position, names, shapes, data types, and parameter totals
 - Full repository, SafeTensors, single-GGUF, metadata-only, and custom-pattern download modes
 - Background downloads with revision selection, byte progress, speed, cancellation, and history
 - Restart recovery: interrupted jobs resume through Hugging Face's local-dir metadata
@@ -123,7 +124,35 @@ Stop it with **Stop HuggingHack.bat** or:
 docker compose down
 ```
 
-Models and the SQLite database are persistent and are not removed by `docker compose down`.
+Models and the default SQLite database are persistent and are not removed by
+`docker compose down`.
+
+## Use PostgreSQL
+
+SQLite remains the zero-configuration default. For a multi-user deployment or an external
+database service, set `DATABASE_URL` to a PostgreSQL connection URL:
+
+```dotenv
+DATABASE_URL=postgresql://hugginghack:password@database-host:5432/hugginghack
+```
+
+HuggingHack creates and upgrades its tables at startup. PostgreSQL credentials stay on the
+server and are not returned by the API.
+
+An optional Compose overlay runs PostgreSQL 17 beside HuggingHack. Add a long URL-safe
+password to `.env`, then start both services:
+
+```dotenv
+POSTGRES_PASSWORD=replace-with-a-long-random-password
+```
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up --build -d
+```
+
+The overlay stores PostgreSQL data in the `postgres-data` named volume and waits for the
+database health check before starting HuggingHack. Back it up separately from `./data`.
+Switching `DATABASE_URL` does not copy an existing SQLite installation into PostgreSQL.
 
 ## Accounts, saved models, and uploads
 
@@ -150,7 +179,7 @@ models/
 Choose a model folder in the browser and HuggingHack sends each file in bounded chunks.
 Interrupted uploads keep their progress and resume from the server's confirmed offset.
 Uploaded repositories are private by default; their owner can share them with every local
-account. Model files stay in the model mount rather than in SQLite.
+account. Model files stay in the model mount rather than in the metadata database.
 
 To preserve the original trusted-LAN behavior, set `ACCOUNTS_ENABLED=false`. This creates a
 single local compatibility identity and skips sign-in. Do not use that mode on an untrusted
@@ -211,8 +240,8 @@ runtime needs the files.
 
 The bucket identity needs `s3:ListBucket` on the bucket and `s3:GetObject`,
 `s3:PutObject`, and `s3:DeleteObject` on the configured prefix.
-Keep the `data` directory backed up too: private upload manifests fail closed unless their
-matching ownership metadata is present in SQLite.
+Keep the metadata database backed up too: private upload manifests fail closed unless their
+matching ownership metadata is present.
 
 ## Send models to Ollama or vLLM
 
@@ -366,6 +395,16 @@ Custom pattern examples:
 
 Patterns use Hugging Face's official `snapshot_download` filtering.
 
+## GGUF metadata and tensors
+
+Repositories containing GGUF files get a **GGUF** tab in the model drawer. Select a file or
+shard to inspect its metadata, tensor names, shapes, data types, quantization breakdown, and
+parameter count without downloading the model weights.
+
+HuggingHack reads only bounded byte ranges from the selected file, caches the result for the
+browser session, and leaves every other shard untouched until you select it. Private and gated
+repositories use the backend's `HF_TOKEN`; the token is never exposed to the browser.
+
 ## Cancel and resume
 
 Active downloads have a **Cancel download** action. Cancellation stops the isolated download worker, keeps already transferred files and Hugging Face local-directory metadata, and marks the job as cancelled in history. Starting the same repository again can reuse those partial files instead of discarding the completed work.
@@ -430,10 +469,11 @@ npm run build
 
 - Models: the host path configured by `MODEL_STORAGE_PATH`
 - S3 mode: durable model objects in `S3_BUCKET` and working copies in `MODEL_STORAGE_PATH`
-- Accounts, sessions, saved collections, repository ownership, download history, and local index: `./data/hugginghack.sqlite3`
+- Accounts, sessions, saved collections, repository ownership, download history, and local
+  index: `./data/hugginghack.sqlite3` by default, or the database named by `DATABASE_URL`
 - Hub metadata cache: `./data/hub-cache`
 
-Back up the models folder and `data` directory together. The index can be rebuilt from model
-files, but SQLite preserves accounts, saved-model organization, ownership, and download
-history. Store backups securely because the database contains password hashes and active
-session hashes.
+Back up the models folder and metadata database together. Keep backing up `data` for the Hub
+cache and for SQLite deployments. The model index can be rebuilt from model files, but the
+database preserves accounts, saved-model organization, ownership, and download history.
+Store backups securely because it contains password hashes and active session hashes.

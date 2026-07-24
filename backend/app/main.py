@@ -3,7 +3,6 @@ from __future__ import annotations
 import hmac
 import json
 import shutil
-import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .auth import AuthService, utc_iso
 from .config import settings, validate_repo_id
-from .database import Database
+from .database import INTEGRITY_ERRORS, Database
 from .downloads import DownloadManager
 from .hub_service import HubService
 from .indexer import LocalModelIndexer
@@ -26,7 +25,7 @@ from .storage import create_model_storage
 from .uploads import UploadManager
 
 
-database = Database(settings.database_path)
+database = Database(settings.database_target)
 hub = HubService(settings)
 indexer = LocalModelIndexer(settings, database)
 model_storage = create_model_storage(settings)
@@ -76,6 +75,7 @@ async def lifespan(_: FastAPI):
     yield
     downloads.shutdown()
     runtimes.shutdown()
+    hub.close()
 
 
 app = FastAPI(
@@ -262,6 +262,7 @@ def health() -> dict:
         "status": "ok" if object_storage["connected"] else "degraded",
         "app": settings.app_name,
         "version": settings.app_version,
+        "database_backend": database.backend,
         "storage": {
             "path": str(settings.model_storage),
             "total_bytes": usage.total,
@@ -303,7 +304,7 @@ def setup_account(payload: SetupRequest, response: Response) -> dict:
         raise HTTPException(status_code=409, detail="The owner account already exists.")
     try:
         user = auth.create_owner(payload.username, payload.display_name, payload.password)
-    except (ValueError, sqlite3.IntegrityError) as error:
+    except (ValueError, *INTEGRITY_ERRORS) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     raw_token, csrf_token = auth.create_session(user["id"])
     set_session_cookie(response, raw_token)
@@ -349,10 +350,10 @@ def create_user(payload: CreateUserRequest, _: AdminUser) -> dict:
         return auth.create_user(
             payload.username, payload.display_name, payload.password, role="member"
         )
-    except (ValueError, sqlite3.IntegrityError) as error:
+    except (ValueError, *INTEGRITY_ERRORS) as error:
         detail = (
             "That username is already in use."
-            if isinstance(error, sqlite3.IntegrityError)
+            if isinstance(error, INTEGRITY_ERRORS)
             else str(error)
         )
         raise HTTPException(status_code=400, detail=detail) from error
@@ -409,6 +410,40 @@ async def search_hub_models(
         item["local"] = item["id"] in local_ids
         item["saved"] = item["id"] in saved_ids
     return {"items": items, "count": len(items)}
+
+
+@app.get("/api/hub/gguf-range")
+async def hub_gguf_range(
+    request: Request,
+    _: CurrentUser,
+    repo_id: Annotated[str, Query(max_length=200)],
+    filename: Annotated[str, Query(max_length=500)],
+    revision: Annotated[str, Query(max_length=200)] = "main",
+) -> Response:
+    try:
+        result = await run_in_threadpool(
+            hub.read_gguf_range,
+            repo_id,
+            filename,
+            revision,
+            request.headers.get("Range"),
+        )
+        return Response(
+            content=result["content"],
+            status_code=result["status_code"],
+            media_type="application/octet-stream",
+            headers=result["headers"],
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=416, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502, detail=f"Unable to read GGUF metadata: {error}"
+        ) from error
 
 
 @app.get("/api/hub/models/{repo_id:path}")
@@ -689,7 +724,7 @@ def create_collection(payload: CollectionRequest, user: WriteUser) -> dict:
                 "updated_at": timestamp,
             }
         )
-    except sqlite3.IntegrityError as error:
+    except INTEGRITY_ERRORS as error:
         raise HTTPException(
             status_code=409, detail="You already have a collection with that name."
         ) from error
@@ -771,7 +806,7 @@ def create_upload_repository(payload: RepositoryRequest, user: WriteUser) -> dic
         return uploads.create_repository(
             user, payload.slug, payload.description, payload.visibility
         )
-    except (ValueError, FileExistsError, sqlite3.IntegrityError) as error:
+    except (ValueError, FileExistsError, *INTEGRITY_ERRORS) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 

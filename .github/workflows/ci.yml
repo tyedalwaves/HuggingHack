@@ -11,6 +11,20 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: hugginghack_test
+          POSTGRES_USER: hugginghack
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hugginghack -d hugginghack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -23,6 +37,7 @@ jobs:
       - run: python -m pytest backend/tests -q
         env:
           PYTHONPATH: backend
+          TEST_POSTGRES_URL: postgresql://hugginghack:test-only-password@127.0.0.1:5432/hugginghack_test
 
   frontend:
     runs-on: ubuntu-latest

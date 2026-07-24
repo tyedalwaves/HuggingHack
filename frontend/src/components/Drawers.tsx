@@ -42,6 +42,7 @@ import {
   prepareModelCardMarkdown,
   resolveModelCardUrl,
 } from '../modelCard'
+import { GgufInspector } from './GgufInspector'
 import type {
   DownloadMode,
   HubFile,
@@ -222,7 +223,7 @@ const ModelCardDocument = memo(function ModelCardDocument({
 export function ModelDrawer({ repoId, onClose, onQueued }: ModelDrawerProps) {
   const [model, setModel] = useState<HubModelDetails | null>(null)
   const [error, setError] = useState('')
-  const [tab, setTab] = useState<'card' | 'files'>('card')
+  const [tab, setTab] = useState<'card' | 'files' | 'gguf'>('card')
   const [revision, setRevision] = useState('main')
   const [mode, setMode] = useState<DownloadMode>('full')
   const [ggufPath, setGgufPath] = useState('')
@@ -496,6 +497,11 @@ export function ModelDrawer({ repoId, onClose, onQueued }: ModelDrawerProps) {
               <button id="model-files-tab" role="tab" aria-selected={tab === 'files'} aria-controls="model-files-panel" className={tab === 'files' ? 'active' : ''} onClick={() => setTab('files')}>
                 Files <span>{model.files.length}</span>
               </button>
+              {ggufFiles.length > 0 && (
+                <button id="model-gguf-tab" role="tab" aria-selected={tab === 'gguf'} aria-controls="model-gguf-panel" className={tab === 'gguf' ? 'active' : ''} onClick={() => setTab('gguf')}>
+                  GGUF <span>{ggufFiles.length}</span>
+                </button>
+              )}
             </div>
             {tab === 'card' ? (
               <section id="model-card-panel" role="tabpanel" aria-labelledby="model-card-tab">
@@ -509,7 +515,7 @@ export function ModelDrawer({ repoId, onClose, onQueued }: ModelDrawerProps) {
                   <div className="empty-compact">This repository does not expose a README model card.</div>
                 )}
               </section>
-            ) : (
+            ) : tab === 'files' ? (
               <div id="model-files-panel" role="tabpanel" aria-labelledby="model-files-tab" className="file-list">
                 {model.files.map((file) => (
                   <div key={file.path} className="file-row">
@@ -518,6 +524,10 @@ export function ModelDrawer({ repoId, onClose, onQueued }: ModelDrawerProps) {
                     <small>{file.size ? formatBytes(file.size) : '—'}</small>
                   </div>
                 ))}
+              </div>
+            ) : (
+              <div id="model-gguf-panel" role="tabpanel" aria-labelledby="model-gguf-tab">
+                <GgufInspector repoId={repoId} revision={revision} files={ggufFiles} />
               </div>
             )}
           </>

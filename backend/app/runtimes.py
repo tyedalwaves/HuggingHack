@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ import httpx
 
 from .auth import utc_iso
 from .config import Settings, repository_path, validate_repo_id
-from .database import Database
+from .database import INTEGRITY_ERRORS, Database
 
 
 TARGET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -317,7 +316,7 @@ class RuntimeManager:
                     "user_id": user_id,
                 }
             )
-        except sqlite3.IntegrityError as error:
+        except INTEGRITY_ERRORS as error:
             raise ValueError(
                 f"{target.name} already has a conflicting active runtime job."
             ) from error

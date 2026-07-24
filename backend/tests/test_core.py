@@ -9,8 +9,9 @@ import pytest
 
 from app.auth import AuthService, verify_password
 from app.config import Settings, repository_path, validate_repo_id
-from app.database import Database
+from app.database import Database, _postgres_query
 from app.downloads import DownloadManager
+from app.hub_service import HubService, parse_gguf_range, validate_gguf_filename
 from app.indexer import LocalModelIndexer
 from app.runtimes import (
     RuntimeManager,
@@ -78,6 +79,89 @@ def test_repo_id_validation_rejects_path_traversal():
     for value in ("../etc", "owner/../../secret", "single-name", "/absolute/model", "owner/model/extra"):
         with pytest.raises(ValueError):
             validate_repo_id(value)
+
+
+def test_gguf_range_validation_is_bounded_and_path_safe():
+    assert validate_gguf_filename("Q4/model-00001-of-00002.gguf") == (
+        "Q4/model-00001-of-00002.gguf"
+    )
+    assert parse_gguf_range("bytes=0-1999999") == (0, 1_999_999)
+
+    for filename in ("../model.gguf", "/model.gguf", "folder\\..\\model.gguf", "model.bin"):
+        with pytest.raises(ValueError):
+            validate_gguf_filename(filename)
+    for range_header in (
+        None,
+        "bytes=0-1,3-4",
+        "bytes=10-9",
+        "bytes=0-2100000",
+        "bytes=49000000-50000000",
+    ):
+        with pytest.raises(ValueError):
+            parse_gguf_range(range_header)
+
+
+def test_hub_service_proxies_only_the_requested_gguf_range(tmp_path: Path):
+    settings = Settings(
+        model_storage=(tmp_path / "models").resolve(),
+        data_dir=(tmp_path / "data").resolve(),
+        hf_token="read-token",
+    )
+    service = HubService(settings)
+    service.range_client.close()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/acme/model/resolve/main/Q4/model.gguf")
+        assert request.headers["Range"] == "bytes=0-3"
+        assert request.headers["Authorization"] == "Bearer read-token"
+        assert request.headers["Accept-Encoding"] == "identity"
+        return httpx.Response(
+            206,
+            content=b"GGUF",
+            headers={"Content-Range": "bytes 0-3/100"},
+        )
+
+    service.range_client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+    try:
+        result = service.read_gguf_range(
+            "acme/model", "Q4/model.gguf", "main", "bytes=0-3"
+        )
+    finally:
+        service.close()
+
+    assert result["status_code"] == 206
+    assert result["content"] == b"GGUF"
+    assert result["headers"]["Content-Range"] == "bytes 0-3/100"
+    assert result["headers"]["Cache-Control"] == "private, max-age=3600"
+
+
+def test_database_target_defaults_to_sqlite_and_accepts_postgresql(tmp_path: Path):
+    sqlite_settings = Settings(data_dir=(tmp_path / "data").resolve())
+    assert sqlite_settings.database_target == sqlite_settings.database_path
+    assert Database(sqlite_settings.database_target).backend == "sqlite"
+
+    postgres_url = "postgresql://hugginghack:secret@postgres:5432/hugginghack"
+    postgres_settings = Settings(
+        data_dir=(tmp_path / "data").resolve(),
+        database_url=postgres_url,
+    )
+    assert postgres_settings.database_target == postgres_url
+    assert Database(postgres_settings.database_target).backend == "postgresql"
+
+
+def test_postgresql_query_adapter_handles_positional_and_named_parameters():
+    assert _postgres_query("SELECT * FROM users WHERE id = ?", ("owner",)) == (
+        "SELECT * FROM users WHERE id = %s"
+    )
+    assert _postgres_query(
+        "UPDATE users SET display_name = :display_name WHERE id = :id",
+        {"display_name": "Owner", "id": "owner"},
+    ) == (
+        "UPDATE users SET display_name = %(display_name)s WHERE id = %(id)s"
+    )
 
 
 def test_indexer_discovers_manually_copied_model(tmp_path: Path):

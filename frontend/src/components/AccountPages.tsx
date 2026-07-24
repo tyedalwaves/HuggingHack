@@ -500,7 +500,7 @@ export function UploadsPage({
         <div>
           <FileUp size={25} />
           <strong>Large-file friendly</strong>
-          <p>Files move in resumable {formatBytes(health?.upload_chunk_bytes || 8 * 1024 * 1024)} chunks and never enter SQLite.</p>
+          <p>Files move in resumable {formatBytes(health?.upload_chunk_bytes || 8 * 1024 * 1024)} chunks and never enter the metadata database.</p>
         </div>
         <div>
           <HardDrive size={25} />

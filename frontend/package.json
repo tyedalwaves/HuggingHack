@@ -11,12 +11,13 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --experimental-strip-types --test test/modelCard.test.mjs"
+    "test": "node --experimental-strip-types --test"
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "5.2.6",
     "@fontsource/ibm-plex-mono": "5.2.6",
     "@fontsource/ibm-plex-sans": "5.2.6",
+    "@huggingface/gguf": "0.4.3",
     "katex": "0.16.21",
     "lucide-react": "0.468.0",
     "react": "18.3.1",

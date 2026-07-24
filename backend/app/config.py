@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -31,6 +31,10 @@ class Settings:
     model_storage: Path = Path(os.getenv("MODEL_STORAGE", "/models")).expanduser().resolve()
     model_storage_backend: str = os.getenv("MODEL_STORAGE_BACKEND", "filesystem").strip().lower()
     data_dir: Path = Path(os.getenv("DATA_DIR", "/data")).expanduser().resolve()
+    database_url: str | None = field(
+        default=(os.getenv("DATABASE_URL") or "").strip() or None,
+        repr=False,
+    )
     hf_endpoint: str = os.getenv("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     hf_token: str | None = os.getenv("HF_TOKEN") or None
     max_concurrent_downloads: int = _positive_int("MAX_CONCURRENT_DOWNLOADS", 2, 8)
@@ -60,6 +64,10 @@ class Settings:
     @property
     def database_path(self) -> Path:
         return self.data_dir / "hugginghack.sqlite3"
+
+    @property
+    def database_target(self) -> Path | str:
+        return self.database_url or self.database_path
 
     @property
     def hub_cache_path(self) -> Path:

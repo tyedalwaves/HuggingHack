@@ -1,10 +1,71 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping, Sequence
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # SQLite remains usable when the optional adapter is absent.
+    psycopg = None
+    dict_row = None
+
+
+if psycopg is None:
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+else:
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+
+
+NAMED_PARAMETER_PATTERN = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _postgres_query(query: str, parameters: object = ()) -> str:
+    if isinstance(parameters, Mapping):
+        return NAMED_PARAMETER_PATTERN.sub(r"%(\1)s", query)
+    return query.replace("?", "%s")
+
+
+class _PostgresConnection:
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    def __enter__(self) -> _PostgresConnection:
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> object:
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def execute(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | Sequence[Any] = (),
+    ) -> Any:
+        return self._connection.execute(_postgres_query(query, parameters), parameters)
+
+    def executemany(
+        self,
+        query: str,
+        parameters: Iterable[Mapping[str, Any] | Sequence[Any]],
+    ) -> Any:
+        parameter_rows = list(parameters)
+        cursor = self._connection.cursor()
+        cursor.executemany(
+            _postgres_query(query, parameter_rows[0] if parameter_rows else ()),
+            parameter_rows,
+        )
+        return cursor
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self._connection.execute(statement)
 
 
 DOWNLOAD_FIELDS = {
@@ -33,11 +94,26 @@ RUNTIME_JOB_FIELDS = {
 
 
 class Database:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, target: Path | str):
+        value = str(target).strip()
+        self.backend = (
+            "postgresql"
+            if value.startswith(("postgresql://", "postgres://"))
+            else "sqlite"
+        )
+        self.path = Path(target) if self.backend == "sqlite" else None
+        self._database_url = value if self.backend == "postgresql" else None
         self._write_lock = threading.RLock()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self) -> sqlite3.Connection | _PostgresConnection:
+        if self.backend == "postgresql":
+            if psycopg is None or dict_row is None:
+                raise RuntimeError(
+                    "PostgreSQL support requires the 'psycopg[binary]' dependency."
+                )
+            connection = psycopg.connect(self._database_url, row_factory=dict_row)
+            return _PostgresConnection(connection)
+        assert self.path is not None
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
@@ -45,19 +121,23 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock, self.connect() as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    username TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL CHECK (role IN ('admin', 'member')),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase
+                    ON users(LOWER(username));
 
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY,
@@ -85,7 +165,8 @@ class Database:
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    user_id TEXT REFERENCES users(id) ON DELETE SET NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_downloads_status
@@ -195,16 +276,13 @@ class Database:
                     ON owned_repositories(owner_id, updated_at DESC);
                 """
             )
-            columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(downloads)").fetchall()
-            }
+            columns = self._column_names(connection, "downloads")
             if "user_id" not in columns:
-                connection.execute("ALTER TABLE downloads ADD COLUMN user_id TEXT")
-            local_model_columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(local_models)").fetchall()
-            }
+                connection.execute(
+                    "ALTER TABLE downloads ADD COLUMN user_id TEXT "
+                    "REFERENCES users(id) ON DELETE SET NULL"
+                )
+            local_model_columns = self._column_names(connection, "local_models")
             if "storage_backend" not in local_model_columns:
                 connection.execute(
                     "ALTER TABLE local_models ADD COLUMN storage_backend "
@@ -220,10 +298,31 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_downloads_user_created "
                 "ON downloads(user_id, created_at DESC)"
             )
-            connection.execute("DELETE FROM sessions WHERE expires_at <= datetime('now')")
+            connection.execute(
+                "DELETE FROM sessions WHERE expires_at <= ?",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+
+    def _column_names(
+        self, connection: sqlite3.Connection | _PostgresConnection, table: str
+    ) -> set[str]:
+        if self.backend == "sqlite":
+            rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = ?
+                """,
+                (table,),
+            ).fetchall()
+        return {row["name"] for row in rows}
 
     @staticmethod
-    def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _decode_row(
+        row: sqlite3.Row | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         if row is None:
             return None
         result = dict(row)
@@ -251,7 +350,8 @@ class Database:
 
     def count_users(self) -> int:
         with self.connect() as connection:
-            return int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            row = connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+            return int(row["count"])
 
     def create_user(self, record: dict[str, Any]) -> dict[str, Any]:
         with self._write_lock, self.connect() as connection:
@@ -275,7 +375,7 @@ class Database:
     def get_user_by_username(self, username: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+                "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)
             ).fetchone()
         return dict(row) if row else None
 
@@ -567,7 +667,9 @@ class Database:
                 rows = connection.execute(
                     """
                     SELECT * FROM local_models
-                    WHERE repo_id LIKE ? OR pipeline_tag LIKE ? OR library_name LIKE ?
+                    WHERE LOWER(repo_id) LIKE LOWER(?)
+                       OR LOWER(pipeline_tag) LIKE LOWER(?)
+                       OR LOWER(library_name) LIKE LOWER(?)
                     ORDER BY modified_at DESC
                     """,
                     (f"%{query}%", f"%{query}%", f"%{query}%"),
@@ -611,8 +713,9 @@ class Database:
         query_clause = ""
         if query:
             query_clause = (
-                " AND (local_models.repo_id LIKE ? OR local_models.pipeline_tag LIKE ? "
-                "OR local_models.library_name LIKE ?)"
+                " AND (LOWER(local_models.repo_id) LIKE LOWER(?) "
+                "OR LOWER(local_models.pipeline_tag) LIKE LOWER(?) "
+                "OR LOWER(local_models.library_name) LIKE LOWER(?))"
             )
             parameters.extend((f"%{query}%", f"%{query}%", f"%{query}%"))
         with self.connect() as connection:
@@ -687,7 +790,7 @@ class Database:
                     ON collection_items.collection_id = collections.id
                 WHERE collections.user_id = ?
                 GROUP BY collections.id
-                ORDER BY collections.name COLLATE NOCASE
+                ORDER BY LOWER(collections.name)
                 """,
                 (user_id,),
             ).fetchall()
@@ -748,7 +851,9 @@ class Database:
         return self.get_saved_model(record["user_id"], record["repo_id"])
 
     def _saved_collections(
-        self, connection: sqlite3.Connection, saved_id: str
+        self,
+        connection: sqlite3.Connection | _PostgresConnection,
+        saved_id: str,
     ) -> list[str]:
         rows = connection.execute(
             "SELECT collection_id FROM collection_items WHERE saved_model_id = ?",
@@ -781,7 +886,10 @@ class Database:
             clauses.append("collection_items.collection_id = ?")
             parameters.append(collection_id)
         if query:
-            clauses.append("(saved_models.repo_id LIKE ? OR saved_models.note LIKE ?)")
+            clauses.append(
+                "(LOWER(saved_models.repo_id) LIKE LOWER(?) "
+                "OR LOWER(saved_models.note) LIKE LOWER(?))"
+            )
             parameters.extend((f"%{query}%", f"%{query}%"))
         with self.connect() as connection:
             rows = connection.execute(

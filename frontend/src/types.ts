@@ -20,6 +20,7 @@ export interface Health {
   status: string
   app: string
   version: string
+  database_backend: 'sqlite' | 'postgresql'
   storage: StorageHealth
   object_storage: ObjectStorageHealth
   hf_token_configured: boolean

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from huggingface_hub import HfApi, hf_hub_download
+import httpx
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 
 from .config import Settings, validate_repo_id
+
+
+GGUF_RANGE_PATTERN = re.compile(r"^bytes=(\d+)-(\d+)$")
+GGUF_MAX_HEADER_BYTES = 50_000_000
+GGUF_MAX_RANGE_BYTES = 2_100_000
 
 
 def _iso(value: Any) -> str | None:
@@ -45,6 +52,34 @@ def _parameter_count(info: Any) -> int | None:
     return None
 
 
+def validate_gguf_filename(filename: str) -> str:
+    value = filename.strip().replace("\\", "/")
+    path = PurePosixPath(value)
+    if (
+        not value
+        or len(value) > 500
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.suffix.lower() != ".gguf"
+    ):
+        raise ValueError("GGUF filename must be a safe repository-relative .gguf path.")
+    return path.as_posix()
+
+
+def parse_gguf_range(value: str | None) -> tuple[int, int]:
+    match = GGUF_RANGE_PATTERN.fullmatch((value or "").strip())
+    if not match:
+        raise ValueError("A single bounded byte range is required.")
+    start, end = (int(part) for part in match.groups())
+    if end < start:
+        raise ValueError("The GGUF byte range is invalid.")
+    if end - start + 1 > GGUF_MAX_RANGE_BYTES:
+        raise ValueError("GGUF range requests are limited to 2.1 MB.")
+    if end >= GGUF_MAX_HEADER_BYTES:
+        raise ValueError("GGUF inspection is limited to the first 50 MB of a file.")
+    return start, end
+
+
 class HubService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -54,6 +89,13 @@ class HubService:
             library_name="hugginghack",
             library_version=settings.app_version,
         )
+        self.range_client = httpx.Client(
+            follow_redirects=True,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+
+    def close(self) -> None:
+        self.range_client.close()
 
     @staticmethod
     def serialize_model(info: Any) -> dict[str, Any]:
@@ -163,3 +205,66 @@ class HubService:
             return None
         return Path(path).read_text(encoding="utf-8", errors="replace")[:120_000]
 
+    def read_gguf_range(
+        self,
+        repo_id: str,
+        filename: str,
+        revision: str,
+        range_header: str | None,
+    ) -> dict[str, Any]:
+        validated_repo = validate_repo_id(repo_id)
+        validated_filename = validate_gguf_filename(filename)
+        start, end = parse_gguf_range(range_header)
+        url = hf_hub_url(
+            repo_id=validated_repo,
+            filename=validated_filename,
+            revision=revision,
+            endpoint=self.settings.hf_endpoint,
+        )
+        headers = {
+            "Accept": "application/octet-stream",
+            "Accept-Encoding": "identity",
+            "Range": f"bytes={start}-{end}",
+            "User-Agent": f"hugginghack/{self.settings.app_version}",
+        }
+        if self.settings.hf_token:
+            headers["Authorization"] = f"Bearer {self.settings.hf_token}"
+
+        with self.range_client.stream("GET", url, headers=headers) as response:
+            if response.status_code in {401, 403}:
+                raise PermissionError(
+                    "Hugging Face denied access to this GGUF file. Check HF_TOKEN and repository access."
+                )
+            if response.status_code == 404:
+                raise FileNotFoundError("The selected GGUF file was not found.")
+            if response.status_code == 416:
+                raise ValueError("The requested GGUF header range is unavailable.")
+            if response.status_code not in {200, 206}:
+                raise RuntimeError(
+                    f"Hugging Face returned status {response.status_code} for the GGUF header."
+                )
+            if response.status_code == 200 and start != 0:
+                raise RuntimeError("The remote file server does not support byte ranges.")
+
+            expected = end - start + 1
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > expected:
+                    raise RuntimeError(
+                        "The remote file server ignored the bounded GGUF range request."
+                    )
+
+            result_headers = {
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "private, max-age=3600",
+                "Vary": "Range",
+            }
+            content_range = response.headers.get("Content-Range")
+            if content_range:
+                result_headers["Content-Range"] = content_range
+            return {
+                "content": bytes(content),
+                "headers": result_headers,
+                "status_code": response.status_code,
+            }

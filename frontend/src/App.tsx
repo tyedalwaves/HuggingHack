@@ -841,6 +841,10 @@ function SettingsPage({
               <dt>Cache path</dt>
               <dd><code>{health?.storage.path || '/models'}</code></dd>
             </div>
+            <div>
+              <dt>Metadata database</dt>
+              <dd>{health?.database_backend === 'postgresql' ? 'PostgreSQL' : 'SQLite'}</dd>
+            </div>
             {health?.object_storage.enabled && (
               <>
                 <div>
