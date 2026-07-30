@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -145,6 +147,14 @@ class S3ModelStorage(FilesystemModelStorage):
             if settings.s3_session_token:
                 client_options["aws_session_token"] = settings.s3_session_token
             client = boto3.client(**client_options)
+
+            def _inject_md5(request, **kwargs):
+                if request.body and "Content-MD5" not in request.headers:
+                    md5_hash = hashlib.md5(request.body).digest()
+                    request.headers["Content-MD5"] = base64.b64encode(md5_hash).decode("utf-8")
+
+            client.meta.events.register("request-created.s3.DeleteObjects", _inject_md5)
+
             chunk_bytes = settings.s3_multipart_chunk_mb * 1024**2
             transfer_config = TransferConfig(
                 multipart_threshold=chunk_bytes,
